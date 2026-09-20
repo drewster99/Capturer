@@ -118,7 +118,7 @@ public final class DemoVideoSource: @unchecked Sendable {
   private init(videos: [PreparedVideo], pixelFormat: OSType) {
     self.videos = videos
     self.pixelFormat = pixelFormat
-    self._naturalSize = videos[0].renderSize
+    self._naturalSize = videos.first?.renderSize ?? .zero
   }
 
   deinit {
@@ -155,14 +155,7 @@ public final class DemoVideoSource: @unchecked Sendable {
         let (nominalFrameRate, naturalSize, preferredTransform) = try await track.load(
           .nominalFrameRate, .naturalSize, .preferredTransform
         )
-        // The size after the transform: a quarter turn swaps width and height, a half turn or no
-        // turn leaves them. Taking the bounding box handles every orientation the recorder can
-        // stamp without special-casing the angle, and matches what a video composition built from
-        // the same track would report as its `renderSize`.
-        let renderSize = CGRect(origin: .zero, size: naturalSize)
-          .applying(preferredTransform)
-          .standardized
-          .size
+        let renderSize = Self.renderSize(naturalSize: naturalSize, transform: preferredTransform)
         videos.append(PreparedVideo(
           url: url,
           asset: asset,
@@ -398,6 +391,27 @@ public final class DemoVideoSource: @unchecked Sendable {
     }
   }
 
+  /// The size of a frame after `transform` — the bounding box of the natural rect through the
+  /// transform, normalized to the origin.
+  ///
+  /// A quarter turn swaps width and height; a half turn or no turn leaves them. Taking the
+  /// bounding box handles every orientation and mirroring the recorder can stamp without
+  /// special-casing the angle, and matches what a video composition built from the same track
+  /// would report as its `renderSize`. Shared by `prepare` and the frame path so the size a
+  /// buffer is allocated at cannot drift from the size `prepare` advertised.
+  static func renderSize(naturalSize: CGSize, transform: CGAffineTransform) -> CGSize {
+    CGRect(origin: .zero, size: naturalSize)
+      .applying(transform)
+      .standardized
+      .size
+  }
+
+  /// Test-only entry point: a source with no videos, for exercising the exact `rotated` path
+  /// (identity early-return, conjugated transform, buffer allocation) without a player or a file.
+  static func forRotationTesting(pixelFormat: OSType = kCVPixelFormatType_32BGRA) -> DemoVideoSource {
+    DemoVideoSource(videos: [], pixelFormat: pixelFormat)
+  }
+
   /// Turns a raw frame upright by applying the track's `preferredTransform` to its pixels.
   ///
   /// Reproduces exactly what `AVPlayerItem.videoComposition` did before the iOS 27 simulator made
@@ -413,7 +427,7 @@ public final class DemoVideoSource: @unchecked Sendable {
   /// is nothing to turn, and the buffer off the output is already IOSurface-backed.
   ///
   /// On the frame thread; the pool and context are not shared with any other thread.
-  private func rotated(
+  func rotated(
     _ source: CVPixelBuffer,
     by transform: CGAffineTransform,
     to renderSize: CGSize
