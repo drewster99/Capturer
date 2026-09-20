@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+import CoreImage
 @preconcurrency import CoreMedia
 import Foundation
 import QuartzCore
@@ -43,14 +44,23 @@ public final class DemoVideoSource: @unchecked Sendable {
   private struct PreparedVideo {
     let url: URL
     let asset: AVURLAsset
-    /// Applies the track's `preferredTransform` to the frames themselves.
+    /// The track's `preferredTransform`, applied to each frame's pixels on the way out.
     ///
     /// A camera records in the sensor's own landscape orientation and it is the preview layer
     /// that turns the picture upright — and that layer is not in this path. Frames straight off
     /// the track are sideways for every consumer: the preview, and the shutter, which returns the
     /// buffer rather than anything the preview did to it. Rotating here is the one place that
     /// fixes both, and it is the same rotation the file already carries.
-    let composition: AVVideoComposition
+    ///
+    /// Applied to the buffers rather than through `AVPlayerItem.videoComposition`: the iOS 27
+    /// simulator runtime refuses *any* video composition (`AVFoundationErrorDomain -11800` /
+    /// OSStatus `-12784`) for every file and every transform, even an identity one, so an item
+    /// carrying a composition never produces a frame there. Rotating the pixel buffer ourselves
+    /// is runtime-independent and reproduces exactly what the composition did, so both the device
+    /// and the simulator take the one path.
+    let transform: CGAffineTransform
+    /// The size of a frame after `transform` — swapped from the track's natural size on a quarter
+    /// turn — which is what every consumer sees and what `naturalSize` reports.
     let renderSize: CGSize
     let nominalFrameRate: Float
   }
@@ -59,6 +69,7 @@ public final class DemoVideoSource: @unchecked Sendable {
   private struct QueuedVideo {
     let item: AVPlayerItem
     let output: AVPlayerItemVideoOutput
+    let transform: CGAffineTransform
     let renderSize: CGSize
     /// Kept only for its lifetime; dropping the struct ends the observation.
     let statusObservation: NSKeyValueObservation
@@ -77,6 +88,14 @@ public final class DemoVideoSource: @unchecked Sendable {
   private var frameThread: FrameThread?
   private var _latestPixelBuffer: CVPixelBuffer?
   private var _naturalSize: CGSize
+
+  /// The rotation apparatus. Touched only on the frame thread — `publishFrame` is its sole
+  /// caller and that runs on the single `FrameThread` — so it needs no lock of its own. A cached
+  /// context and a reusable pool because this runs once per display refresh, up to 60 times a
+  /// second: allocating a context or a buffer per frame is what the pool exists to avoid.
+  private let rotationContext = CIContext(options: [.cacheIntermediates: false])
+  private var rotationPool: CVPixelBufferPool?
+  private var rotationPoolSize: CGSize = .zero
 
   /// The frame most recently published.
   ///
@@ -133,13 +152,22 @@ public final class DemoVideoSource: @unchecked Sendable {
         guard let track = try await asset.loadTracks(withMediaType: .video).first else {
           throw Error.noVideoTrack(url)
         }
-        let nominalFrameRate = try await track.load(.nominalFrameRate)
-        let composition = try await AVMutableVideoComposition.videoComposition(withPropertiesOf: asset)
+        let (nominalFrameRate, naturalSize, preferredTransform) = try await track.load(
+          .nominalFrameRate, .naturalSize, .preferredTransform
+        )
+        // The size after the transform: a quarter turn swaps width and height, a half turn or no
+        // turn leaves them. Taking the bounding box handles every orientation the recorder can
+        // stamp without special-casing the angle, and matches what a video composition built from
+        // the same track would report as its `renderSize`.
+        let renderSize = CGRect(origin: .zero, size: naturalSize)
+          .applying(preferredTransform)
+          .standardized
+          .size
         videos.append(PreparedVideo(
           url: url,
           asset: asset,
-          composition: composition,
-          renderSize: composition.renderSize,
+          transform: preferredTransform,
+          renderSize: renderSize,
           nominalFrameRate: nominalFrameRate
         ))
       } catch let error as Error {
@@ -274,7 +302,9 @@ public final class DemoVideoSource: @unchecked Sendable {
     // A fresh item each time: a player item plays once, so looping means a new item for the same
     // asset, which is what the prepared asset is kept for.
     let item = AVPlayerItem(asset: video.asset)
-    item.videoComposition = video.composition
+    // No `item.videoComposition`: the iOS 27 simulator refuses any composition and the item then
+    // never produces a frame. The transform travels with `QueuedVideo` and is applied to each
+    // pulled buffer in `publishFrame` instead.
     let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
       kCVPixelBufferPixelFormatTypeKey as String: pixelFormat,
       // Without this the buffers are not IOSurface-backed, and `CALayer.contents` — how a preview
@@ -295,6 +325,7 @@ public final class DemoVideoSource: @unchecked Sendable {
     queued.append(QueuedVideo(
       item: item,
       output: output,
+      transform: video.transform,
       renderSize: video.renderSize,
       statusObservation: statusObservation
     ))
@@ -329,8 +360,16 @@ public final class DemoVideoSource: @unchecked Sendable {
     for video in candidates {
       let itemTime = video.output.itemTime(forHostTime: hostTime)
       guard video.output.hasNewPixelBuffer(forItemTime: itemTime),
-            let pixelBuffer = video.output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil)
+            let rawBuffer = video.output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil)
       else {
+        continue
+      }
+
+      // The buffer off the track is in the sensor's orientation; the transform turns it upright.
+      // A failure here is skipped rather than emitted sideways — the next tick tries again — and
+      // logged so a wholesale failure is not silent.
+      guard let pixelBuffer = rotated(rawBuffer, by: video.transform, to: video.renderSize) else {
+        Log.error(.capture, "DemoVideoSource could not apply a frame's rotation; skipping it")
         continue
       }
 
@@ -357,6 +396,77 @@ public final class DemoVideoSource: @unchecked Sendable {
       }
       return
     }
+  }
+
+  /// Turns a raw frame upright by applying the track's `preferredTransform` to its pixels.
+  ///
+  /// Reproduces exactly what `AVPlayerItem.videoComposition` did before the iOS 27 simulator made
+  /// that route unusable. `preferredTransform` is authored in the video's top-left, y-down
+  /// coordinate space, while Core Image works bottom-left and y-up; applying the transform naively
+  /// would rotate the wrong way (a quarter turn would come out a half turn off). So the transform
+  /// is conjugated by a vertical flip — flip into the video's space, apply the transform there,
+  /// flip back — and the result is translated so its extent begins at the origin, which is what
+  /// makes it fill the output buffer. Deriving everything from the transform this way covers every
+  /// orientation and mirroring the recorder can stamp, not just a quarter turn.
+  ///
+  /// An identity transform (footage recorded with no rotation) returns the buffer untouched: there
+  /// is nothing to turn, and the buffer off the output is already IOSurface-backed.
+  ///
+  /// On the frame thread; the pool and context are not shared with any other thread.
+  private func rotated(
+    _ source: CVPixelBuffer,
+    by transform: CGAffineTransform,
+    to renderSize: CGSize
+  ) -> CVPixelBuffer? {
+    guard !transform.isIdentity else { return source }
+
+    let raw = CIImage(cvPixelBuffer: source)
+    let sourceHeight = raw.extent.height
+    let intoVideoSpace = CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: sourceHeight)
+    let turned = raw.transformed(by: intoVideoSpace).transformed(by: transform)
+    // Flip back to Core Image's y-up space and move the extent to the origin in one step.
+    let extent = turned.extent
+    let backToOrigin = CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: -extent.minX, ty: extent.maxY)
+    let upright = turned.transformed(by: backToOrigin)
+
+    guard let destination = makeRotationBuffer(size: renderSize) else { return nil }
+    rotationContext.render(upright, to: destination)
+    return destination
+  }
+
+  /// A pooled, IOSurface-backed BGRA buffer of `size`, recreating the pool when the size changes.
+  ///
+  /// IOSurface-backed because `CALayer.contents` — how the preview draws a frame — shows nothing
+  /// for a buffer without it, so the substitution has to hand downstream the same backing a camera
+  /// would. On the frame thread.
+  private func makeRotationBuffer(size: CGSize) -> CVPixelBuffer? {
+    let width = Int(size.width.rounded())
+    let height = Int(size.height.rounded())
+    guard width > 0, height > 0 else { return nil }
+
+    if rotationPool == nil || rotationPoolSize != size {
+      let attributes: [String: Any] = [
+        kCVPixelBufferPixelFormatTypeKey as String: pixelFormat,
+        kCVPixelBufferWidthKey as String: width,
+        kCVPixelBufferHeightKey as String: height,
+        kCVPixelBufferIOSurfacePropertiesKey as String: [:] as CFDictionary
+      ]
+      var pool: CVPixelBufferPool?
+      guard CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attributes as CFDictionary, &pool) == kCVReturnSuccess,
+            let pool
+      else {
+        return nil
+      }
+      rotationPool = pool
+      rotationPoolSize = size
+    }
+
+    guard let pool = rotationPool else { return nil }
+    var buffer: CVPixelBuffer?
+    guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &buffer) == kCVReturnSuccess else {
+      return nil
+    }
+    return buffer
   }
 
   /// A thread whose only job is to run a display link.
