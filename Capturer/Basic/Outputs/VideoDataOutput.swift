@@ -68,7 +68,10 @@ open class VideoDataOutput: _StatefulObjectBase, SampleBufferOutputNodeType, Pix
     update(with: state, oldState: nil)
   }
 
-  public func setUp(sessionInConfiguring: AVCaptureSession) {
+  public func setUp(sessionInConfiguring: AVCaptureSession) throws {
+    guard sessionInConfiguring.canAddOutput(output) else {
+      throw SessionAttachmentError.sessionRefusedOutput(outputType: String(describing: type(of: output)))
+    }
     sessionInConfiguring.addOutput(output)
   }
 

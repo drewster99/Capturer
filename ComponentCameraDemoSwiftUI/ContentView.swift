@@ -29,11 +29,14 @@ final class ViewModel: ObservableObject {
     self.output = output
 
     Task {
-
-      let input = try CameraInput.bestBuiltInDevice(position: .back)
-      await sessionManager.attach(input: input)
-      await sessionManager.attach(output: output)
-      await sessionManager.start()
+      do {
+        let input = try CameraInput.bestBuiltInDevice(position: .back)
+        try await sessionManager.attach(input: input)
+        try await sessionManager.attach(output: output)
+        await sessionManager.start()
+      } catch {
+        print("Camera setup failed: \(error)")
+      }
     }
 
   }

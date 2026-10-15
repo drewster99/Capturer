@@ -3,7 +3,9 @@ import Foundation
 import AVFoundation
 
 public protocol OutputNodeType: AnyObject, Sendable {
-  func setUp(sessionInConfiguring: AVCaptureSession)
+  /// Adds this node to a session that is between `beginConfiguration()` and
+  /// `commitConfiguration()`. Throws `SessionAttachmentError` when the session refuses it.
+  func setUp(sessionInConfiguring: AVCaptureSession) throws
   func tearDown(sessionInConfiguring: AVCaptureSession)
 }
 

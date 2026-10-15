@@ -14,8 +14,8 @@ public final class AnyCMSampleBufferOutput: _StatefulObjectBase, OutputNodeType,
     self.backing = backing
   }
 
-  public func setUp(sessionInConfiguring: AVCaptureSession) {
-    backing.setUp(sessionInConfiguring: sessionInConfiguring)
+  public func setUp(sessionInConfiguring: AVCaptureSession) throws {
+    try backing.setUp(sessionInConfiguring: sessionInConfiguring)
   }
 
   public func tearDown(sessionInConfiguring: AVCaptureSession) {

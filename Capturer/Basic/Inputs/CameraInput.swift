@@ -14,8 +14,10 @@ public final class CameraInput: _StatefulObjectBase, DeviceInputNodeType, @unche
     super.init()
   }
 
-  public func setUp(sessionInConfiguring: AVCaptureSession) {
-      // Are those actually thread safe ?
+  public func setUp(sessionInConfiguring: AVCaptureSession) throws {
+    guard sessionInConfiguring.canAddInput(captureDeviceInput) else {
+      throw SessionAttachmentError.sessionRefusedInput(inputType: String(describing: type(of: captureDeviceInput)))
+    }
     sessionInConfiguring.addInput(captureDeviceInput)
   }
 

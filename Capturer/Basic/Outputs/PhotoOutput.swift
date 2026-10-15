@@ -157,7 +157,10 @@ public final class PhotoOutput: _StatefulObjectBase, OutputNodeType, @unchecked 
   //
   //  }
 
-  public func setUp(sessionInConfiguring: AVCaptureSession) {
+  public func setUp(sessionInConfiguring: AVCaptureSession) throws {
+    guard sessionInConfiguring.canAddOutput(_output) else {
+      throw SessionAttachmentError.sessionRefusedOutput(outputType: String(describing: type(of: _output)))
+    }
     sessionInConfiguring.addOutput(_output)
   }
 
