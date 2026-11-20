@@ -736,7 +736,7 @@ final class DemoCameraTests: XCTestCase {
     XCTAssertFalse(bus.hasTargets)
   }
 
-  /// `PixelBufferView.attach` cancels a previous subscription, and `AnyCVPixelBufferOutput`
+  /// A consumer re-attaching cancels its previous subscription, and `AnyCVPixelBufferOutput`
   /// cancels from `deinit`, while frames may be in flight. The lock is not recursive: this only
   /// works because handlers run outside it, and a tidy-up that held it through the loop would
   /// deadlock the camera's delegate queue.
@@ -952,7 +952,7 @@ final class DemoCameraTests: XCTestCase {
     XCTAssertTrue(slot.replace(with: 4), "empty again, so the next producer must schedule a consumer")
   }
 
-  /// The contract `PixelBufferView` relies on: one consumer per `true`, every consumer finds a
+  /// The contract a latest-frame consumer relies on: one consumer per `true`, every consumer finds a
   /// value, nothing is left behind, and a serial producer's consumer never sees an older frame.
   func testEverySignalledConsumerFindsAValueAndValuesOnlyMoveForward() {
     let slot = LatestValueSlot<Int>()
@@ -998,62 +998,6 @@ final class DemoCameraTests: XCTestCase {
     XCTAssertEqual(taken.snapshot.count, signals.count)
     XCTAssertFalse(taken.snapshot.contains(nil), "a consumer was scheduled for an empty slot")
     XCTAssertNil(slot.take(), "a value was left behind with no consumer scheduled for it")
-  }
-
-  // MARK: - Preview view
-
-  /// Frames arrive off-main and the layer is set on main; of a burst, the newest frame is the
-  /// one that ends up on screen.
-  @MainActor
-  func testPreviewViewShowsTheNewestFrameOnMain() async throws {
-    let output = VideoDataOutput()
-    let view = PixelBufferView(frame: CGRect(x: 0, y: 0, width: 10, height: 10))
-    view.attach(output: output)
-    let first = try CMSampleBuffer.wrapping(imageBuffer: try makePixelBuffer(luma: 1), presentationTime: .zero)
-    let newestPixelBuffer = try makePixelBuffer(luma: 2)
-    let newest = try CMSampleBuffer.wrapping(
-      imageBuffer: newestPixelBuffer,
-      presentationTime: CMTime(value: 1, timescale: 30)
-    )
-
-    await Task.detached {
-      output.emit(sampleBuffer: first)
-      output.emit(sampleBuffer: newest)
-    }.value
-
-    // Polled on main so the hop the view scheduled onto the main queue gets to run.
-    let deadline = Date().addingTimeInterval(5)
-    while (view.layer.contents as AnyObject?) !== newestPixelBuffer, Date() < deadline {
-      try await Task.sleep(nanoseconds: 50_000_000)
-    }
-    XCTAssertTrue(
-      (view.layer.contents as AnyObject?) === newestPixelBuffer,
-      "the layer should show the newest frame, not an older one and not nothing"
-    )
-  }
-
-  /// Re-attaching while a frame from the previous output is still queued for main must not
-  /// paint that frame. Emitting on main here keeps the hop queued behind the test until it
-  /// yields, so the re-attach is guaranteed to happen first.
-  @MainActor
-  func testReattachingDiscardsAFrameStillOnItsWayFromThePreviousOutput() async throws {
-    let previousOutput = VideoDataOutput()
-    let nextOutput = VideoDataOutput()
-    let view = PixelBufferView(frame: CGRect(x: 0, y: 0, width: 10, height: 10))
-    let staleFrame = try CMSampleBuffer.wrapping(imageBuffer: try makePixelBuffer(luma: 1), presentationTime: .zero)
-    let livePixelBuffer = try makePixelBuffer(luma: 2)
-    let liveFrame = try CMSampleBuffer.wrapping(imageBuffer: livePixelBuffer, presentationTime: .zero)
-
-    view.attach(output: previousOutput)
-    previousOutput.emit(sampleBuffer: staleFrame)
-    view.attach(output: nextOutput)
-
-    try await Task.sleep(nanoseconds: 100_000_000)
-    XCTAssertNil(view.layer.contents, "a frame from the replaced subscription was painted")
-
-    nextOutput.emit(sampleBuffer: liveFrame)
-    try await Task.sleep(nanoseconds: 100_000_000)
-    XCTAssertTrue((view.layer.contents as AnyObject?) === livePixelBuffer, "the new output's frame should be painted")
   }
 
   // MARK: - Test support

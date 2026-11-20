@@ -22,10 +22,12 @@ let photoOutput = PhotoOutput()
 await captureBody.attach(output: previewOutput)
 await captureBody.attach(output: photoOutput)
 
-let previewView = PixelBufferView()
-previewView.attach(output: previewOutput)
-
 captureBody.start()
+```
+
+```swift
+// SwiftUI: the session's own preview layer, kept upright as the device turns.
+CapturePreviewView(captureBody: captureBody)
 ```
 
 ## License

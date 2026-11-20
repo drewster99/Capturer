@@ -10,9 +10,9 @@ import UIKit
 /// so the rendered preview is always upright regardless of physical
 /// device orientation — including iPad rotations.
 ///
-/// Preferred over wrapping `PixelBufferView` for the live preview path.
-/// `PixelBufferView` is still appropriate when the preview must be processed
-/// through a `CVPixelBuffer` pipeline (Core Image filters, custom shaders, etc.).
+/// The package's only preview view (5.0.0 removed `PixelBufferView` and
+/// `CoreImagePixelBufferView`, which no app constructed). A preview that must be
+/// processed frame by frame draws `PreviewOutput`'s pixel buffers itself.
 public struct CapturePreviewView: UIViewRepresentable {
     public let captureBody: CaptureBody
     public var videoGravity: AVLayerVideoGravity
