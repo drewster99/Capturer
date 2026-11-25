@@ -146,17 +146,21 @@ open class VideoDataOutput: _StatefulObjectBase, SampleBufferOutputNodeType, Pix
   /// keeping up, which is why they are not discarded silently.
   private final class DroppedFrameLog: @unchecked Sendable {
 
-    private static let reportInterval: TimeInterval = 1
+    private static let reportInterval: Duration = .seconds(1)
 
+    /// A clock that only moves forward: a wall-clock jump back would silence the reports until the
+    /// clock caught up. Not `ProcessInfo.systemUptime`, a required-reason API that every app
+    /// compiling Capturer would have to declare in its privacy manifest.
+    private let clock = ContinuousClock()
     private let lock = NSLock()
     private var droppedSinceLastReport = 0
-    private var lastReport: TimeInterval = 0
+    private var lastReport: ContinuousClock.Instant?
 
     func record(reason: String) {
       lock.lock()
       droppedSinceLastReport += 1
-      let now = ProcessInfo.processInfo.systemUptime
-      guard now - lastReport >= Self.reportInterval else {
+      let now = clock.now
+      if let lastReport, lastReport.duration(to: now) < Self.reportInterval {
         lock.unlock()
         return
       }
